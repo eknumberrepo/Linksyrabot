@@ -9,20 +9,19 @@ from telegram.ext import (
     filters,
 )
 
-from config import BOT_TOKEN
-from db import save_file, get_file
+from config import BOT_TOKEN, CHANNEL_ID, CHANNEL_USERNAME, PREMIUM_USERS
+from db import save_file, get_file, delete_file, increment_views, get_expired
 from utils import generate_token, hash_password, get_expiry
-
-CHANNEL_USERNAME = "@BotXHubz"
 
 user_state = {}
 
 
 # 🔒 Check subscription
 async def check_sub(update, context):
-    user_id = update.effective_user.id
     try:
-        member = await context.bot.get_chat_member(CHANNEL_USERNAME, user_id)
+        member = await context.bot.get_chat_member(
+            CHANNEL_USERNAME, update.effective_user.id
+        )
         return member.status in ["member", "administrator", "creator"]
     except:
         return False
@@ -32,9 +31,230 @@ async def check_sub(update, context):
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     args = context.args
 
-    # Handle link access
     if args:
         token = args[0]
+        data = get_file(token)
+
+        if not data:
+            return await update.message.reply_text("❌ File not found")
+
+        token, msg_id, password, expiry, views, one_time = data
+
+        if expiry and time.time() > expiry:
+            return await update.message.reply_text("⏳ Link expired")
+
+        if password:
+            user_state[update.effective_user.id] = ("verify", token)
+            return await update.message.reply_text("🔐 Enter password:")
+
+        increment_views(token)
+
+        await context.bot.copy_message(
+            chat_id=update.effective_chat.id,
+            from_chat_id=CHANNEL_ID,
+            message_id=msg_id
+        )
+
+        if one_time:
+            delete_file(token)
+
+        return
+
+    if not await check_sub(update, context):
+        buttons = [
+            [InlineKeyboardButton("📢 Join Channel", url=f"https://t.me/{CHANNEL_USERNAME[1:]}")],
+            [InlineKeyboardButton("✅ I Joined", callback_data="check_sub")]
+        ]
+        return await update.message.reply_text(
+            "🔒 Join our channel to use the bot",
+            reply_markup=InlineKeyboardMarkup(buttons)
+        )
+
+    await update.message.reply_text("📤 Send a file to generate link")
+
+
+# 📦 Handle file
+async def handle_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not await check_sub(update, context):
+        return await start(update, context)
+
+    sent = await context.bot.copy_message(
+        chat_id=CHANNEL_ID,
+        from_chat_id=update.message.chat_id,
+        message_id=update.message.message_id
+    )
+
+    msg_id = sent.message_id
+
+    user_state[update.effective_user.id] = ("ask_password", msg_id)
+
+    buttons = [
+        [
+            InlineKeyboardButton("🔐 Password", callback_data="set_pass"),
+            InlineKeyboardButton("⏭ Skip", callback_data="skip_pass")
+        ]
+    ]
+
+    await update.message.reply_text(
+        "🔐 Protect this file?",
+        reply_markup=InlineKeyboardMarkup(buttons)
+    )
+
+
+# 🎛️ Buttons
+async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    user_id = query.from_user.id
+
+    if query.data == "check_sub":
+        if await check_sub(update, context):
+            return await query.message.edit_text("✅ Send file now")
+        else:
+            return await query.answer("❌ Not joined", show_alert=True)
+
+    if query.data in ["set_pass", "skip_pass"]:
+        state, msg_id = user_state[user_id]
+
+        if query.data == "set_pass":
+            user_state[user_id] = ("set_password", msg_id)
+            return await query.message.edit_text("🔐 Send password")
+        else:
+            user_state[user_id] = ("set_expiry", (msg_id, None, 0))
+            return await send_expiry_buttons(query)
+
+    if query.data == "one_time":
+        msg_id, password, _ = user_state[user_id][1]
+        user_state[user_id] = ("set_expiry", (msg_id, password, 1))
+        return await send_expiry_buttons(query)
+
+    if query.data.startswith("exp_"):
+        msg_id, password, one_time = user_state[user_id][1]
+
+        if user_id not in PREMIUM_USERS:
+            expiry = get_expiry(3600)
+        else:
+            expiry = {
+                "exp_10": 600,
+                "exp_1h": 3600,
+                "exp_1d": 86400
+            }.get(query.data, 3600)
+            expiry = get_expiry(expiry)
+
+        token = generate_token()
+        save_file(token, msg_id, password, expiry, one_time)
+
+        link = f"https://t.me/{context.bot.username}?start={token}"
+
+        await query.message.edit_text(f"🔗 {link}")
+        del user_state[user_id]
+
+
+# ⏳ Expiry UI
+async def send_expiry_buttons(query):
+    buttons = [
+        [
+            InlineKeyboardButton("⏳ 10m", callback_data="exp_10"),
+            InlineKeyboardButton("⏳ 1h", callback_data="exp_1h"),
+        ],
+        [
+            InlineKeyboardButton("⏳ 1d", callback_data="exp_1d"),
+            InlineKeyboardButton("🔥 One-time", callback_data="one_time")
+        ]
+    ]
+
+    await query.message.edit_text(
+        "⏳ Select expiry:",
+        reply_markup=InlineKeyboardMarkup(buttons)
+    )
+
+
+# 🔐 Password + verify
+async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+
+    if user_id not in user_state:
+        return
+
+    state, data = user_state[user_id]
+
+    if state == "set_password":
+        msg_id = data
+        password = hash_password(update.message.text)
+
+        user_state[user_id] = ("set_expiry", (msg_id, password, 0))
+
+        await update.message.reply_text("⏳ Choose expiry")
+        return await send_expiry_buttons(update)
+
+    if state == "verify":
+        token = data
+        db_data = get_file(token)
+
+        if not db_data:
+            return await update.message.reply_text("❌ Invalid")
+
+        token, msg_id, password, expiry, views, one_time = db_data
+
+        if hash_password(update.message.text) == password:
+            increment_views(token)
+
+            await context.bot.copy_message(
+                chat_id=update.effective_chat.id,
+                from_chat_id=CHANNEL_ID,
+                message_id=msg_id
+            )
+
+            if one_time:
+                delete_file(token)
+        else:
+            await update.message.reply_text("❌ Wrong password")
+
+
+# 🧹 Cleanup
+async def cleanup(context):
+    now = int(time.time())
+    rows = get_expired(now)
+
+    for token, msg_id in rows:
+        try:
+            await context.bot.delete_message(CHANNEL_ID, msg_id)
+        except:
+            pass
+        delete_file(token)
+
+
+# 📖 Help
+async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text("📖 Send file → get secure link")
+
+
+# ℹ️ About
+async def about(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text("🔐 LinksyraBot - Secure sharing")
+
+
+# 🚀 Main
+def main():
+    app = ApplicationBuilder().token(BOT_TOKEN).build()
+
+    app.add_handler(CommandHandler("start", start))
+    app.add_handler(CommandHandler("help", help_command))
+    app.add_handler(CommandHandler("about", about))
+
+    app.add_handler(MessageHandler(filters.Document.ALL | filters.VIDEO | filters.PHOTO, handle_file))
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
+
+    app.add_handler(CallbackQueryHandler(button_handler))
+
+    app.job_queue.run_repeating(cleanup, interval=300)
+
+    print("🚀 PRO BOT RUNNING")
+    app.run_polling(close_loop=False)
+
+
+if __name__ == "__main__":
+    main()        token = args[0]
         data = get_file(token)
 
         if not data:
